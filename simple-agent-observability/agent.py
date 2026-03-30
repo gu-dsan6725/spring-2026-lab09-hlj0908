@@ -1,8 +1,9 @@
 """
-Simple Strands Agent with DuckDuckGo and Braintrust Observability.
+Simple Strands Agent with DuckDuckGo, Context7 MCP, and Braintrust Observability.
 
 This agent demonstrates:
 - DuckDuckGo web search tool
+- Context7 MCP server integration
 - Braintrust observability using OpenTelemetry
 - Anthropic Claude Haiku via Strands
 """
@@ -16,10 +17,11 @@ from typing import Optional
 from braintrust.otel import BraintrustSpanProcessor
 from ddgs import DDGS
 from dotenv import load_dotenv
+from mcp.client.streamable_http import streamablehttp_client
 from opentelemetry.sdk.trace import TracerProvider
 from strands import Agent
-from strands.telemetry import StrandsTelemetry
 from strands.tools.decorator import tool
+from strands.tools.mcp import MCPClient
 
 
 # Configure logging
@@ -31,13 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 # Load environment variables
-load_dotenv()
+# override=True is important so .env replaces any stale shell / inherited placeholders
+load_dotenv(dotenv_path=".env", override=True)
 
 
-def _get_env_var(
-    key: str,
-    default: Optional[str] = None
-) -> str:
+def _get_env_var(key: str, default: Optional[str] = None) -> str:
     """Get environment variable or raise error if not found."""
     value = os.getenv(key, default)
     if value is None:
@@ -46,32 +46,41 @@ def _get_env_var(
 
 
 @tool
-def duckduckgo_search(
-    query: str,
-    max_results: int = 5
-) -> str:
+def duckduckgo_search(query: str, max_results: int = 5) -> str:
     """
-    Search DuckDuckGo for the given query. Use this for current events, news, general information, or any topic that requires web search.
+    Search DuckDuckGo for the given query.
+
+    Use this for:
+    - current events
+    - general web information
+    - news
+    - broad factual lookups
 
     Args:
-        query: The search query string
-        max_results: Maximum number of results to return
+        query: search query string
+        max_results: maximum number of results to return
 
     Returns:
         JSON string containing search results
     """
     try:
+        query = " ".join(str(query).splitlines()).strip()
         logger.info(f"Searching DuckDuckGo for: {query}")
 
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
 
         logger.info(f"Found {len(results)} results")
-        return json.dumps(results, indent=2)
+        return json.dumps(results, indent=2).rstrip()
 
     except Exception as e:
         logger.error(f"DuckDuckGo search failed: {e}")
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": str(e)}).rstrip()
+
+
+def create_streamable_http_transport():
+    """Create streamable HTTP transport for the Context7 MCP server."""
+    return streamablehttp_client("https://mcp.context7.com/mcp")
 
 
 def _setup_observability() -> TracerProvider:
@@ -83,21 +92,17 @@ def _setup_observability() -> TracerProvider:
     """
     logger.info("Setting up Braintrust observability")
 
-    # Get Braintrust configuration
-    braintrust_api_key = _get_env_var("BRAINTRUST_API_KEY")
-    braintrust_project = _get_env_var("BRAINTRUST_PROJECT")
+    braintrust_api_key = _get_env_var("BRAINTRUST_API_KEY").strip()
+    braintrust_project = _get_env_var("BRAINTRUST_PROJECT").strip()
 
-    # Create TracerProvider and add Braintrust processor
-    # Pass api_key and parent directly to BraintrustSpanProcessor
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(
         BraintrustSpanProcessor(
             api_key=braintrust_api_key,
-            parent=braintrust_project
+            parent=braintrust_project,
         )
     )
 
-    # Set tracer provider as global
     from opentelemetry import trace
     trace.set_tracer_provider(tracer_provider)
 
@@ -114,46 +119,61 @@ def _create_agent() -> Agent:
     """
     logger.info("Creating Strands agent")
 
-    # Set up observability
-    tracer_provider = _setup_observability()
-    telemetry = StrandsTelemetry(tracer_provider=tracer_provider)
+    _setup_observability()
 
-    # Get API key and set it in environment for LiteLLM
-    anthropic_api_key = _get_env_var("ANTHROPIC_API_KEY")
+    anthropic_api_key = _get_env_var("ANTHROPIC_API_KEY").strip()
     os.environ["ANTHROPIC_API_KEY"] = anthropic_api_key
 
-    # Configure the agent with system prompt
-    system_prompt = """You are a helpful AI assistant with access to DuckDuckGo web search.
+    # Optional debug preview
+    logger.info(
+        f"ANTHROPIC key preview: {repr(anthropic_api_key[:12])} ... len={len(anthropic_api_key)}"
+    )
 
-Use the DuckDuckGo search tool to find current information, news, and answers to questions.
-Provide clear, accurate, and helpful responses based on the search results.
-Always cite your sources when using search results."""
+    system_prompt = """You are a helpful AI assistant with access to:
+1. DuckDuckGo web search for current events, news, and general web information
+2. Context7 MCP tools for programming documentation and library/framework usage
 
-    # Create agent with Anthropic Claude 3 Haiku and DuckDuckGo tool
-    # Use Anthropic model directly (not through Bedrock)
-    # API key is already set in environment variable above
+Tool routing rules:
+- Use DuckDuckGo for news, current events, broad web search, and general information.
+- Use Context7 MCP tools for technical documentation, API/library/framework usage, and programming questions.
+- If asked what MCP tools are available, explain the loaded MCP tools clearly.
+- For technical questions, prefer MCP documentation tools when applicable.
+- Keep responses concise and useful.
+- Do not include trailing whitespace at the end of any response.
+"""
+
     from strands.models import AnthropicModel
 
     model = AnthropicModel(
         model_id="claude-3-haiku-20240307",
-        max_tokens=4096
+        max_tokens=4096,
     )
 
-    # Create agent - observability is already configured globally via TracerProvider
+    streamable_http_mcp_client = MCPClient(create_streamable_http_transport)
+
+    # Load MCP tools once during agent creation
+    with streamable_http_mcp_client:
+        logger.info("Connecting to Context7 MCP server...")
+        mcp_tools = streamable_http_mcp_client.list_tools_sync()
+        logger.info(f"Loaded {len(mcp_tools)} MCP tools from Context7")
+
+        for tool_obj in mcp_tools:
+            tool_name = getattr(tool_obj, "tool_name", None) or getattr(tool_obj, "name", None)
+            logger.info(f"MCP tool loaded: {tool_name if tool_name else repr(tool_obj)}")
+
+    tools = [duckduckgo_search] + mcp_tools
+
     agent = Agent(
         system_prompt=system_prompt,
         model=model,
-        tools=[duckduckgo_search]
+        tools=tools,
     )
 
-    logger.info("Agent created successfully with Braintrust observability")
+    logger.info("Agent created successfully with Braintrust observability and MCP tools")
     return agent
 
 
-async def _run_agent_async(
-    agent: Agent,
-    user_input: str
-) -> str:
+async def _run_agent_async(agent: Agent, user_input: str) -> str:
     """
     Run the agent asynchronously with the given input.
 
@@ -162,11 +182,15 @@ async def _run_agent_async(
         user_input: User's question or prompt
 
     Returns:
-        Agent's response
+        Agent response as string
     """
+    user_input = " ".join(str(user_input).splitlines()).strip()
     logger.info(f"Processing user input: {user_input}")
 
     response = await agent.invoke_async(user_input)
+
+    # Normalize output to avoid accidental trailing whitespace propagation
+    response = str(response).rstrip()
 
     logger.info("Agent response generated")
     return response
@@ -174,29 +198,22 @@ async def _run_agent_async(
 
 def main() -> None:
     """Main function to run the agent."""
-    logger.info("Starting Simple Agent with Observability")
+    logger.info("Starting Simple Agent with MCP + Observability")
 
-    # Create agent
     agent = _create_agent()
 
-    # Example queries to test different tools
-    test_queries = [
-        "What is the latest news about AI?",
-        "How do I use async/await in Python?",
-        "What are the best practices for React hooks?"
-    ]
-
-    print("\n" + "="*80)
-    print("Simple Agent with Observability Demo")
-    print("="*80 + "\n")
-
-    # Run interactive loop
-    print("Ask me anything! I can search the web with DuckDuckGo.")
-    print("Type 'quit' to exit.\n")
+    print("\n" + "=" * 80)
+    print("Simple Agent with MCP + Observability Demo")
+    print("=" * 80)
+    print()
+    print("Ask me anything! I can search the web with DuckDuckGo and use Context7 MCP tools.")
+    print("Type 'quit' to exit.")
+    print()
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input("You: ")
+            user_input = " ".join(user_input.splitlines()).strip()
 
             if user_input.lower() in ["quit", "exit", "q"]:
                 print("\nGoodbye!")
@@ -205,9 +222,7 @@ def main() -> None:
             if not user_input:
                 continue
 
-            # Run agent
             response = asyncio.run(_run_agent_async(agent, user_input))
-
             print(f"\nAgent: {response}\n")
 
         except EOFError:
